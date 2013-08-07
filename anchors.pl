@@ -5,6 +5,8 @@ use warnings;
 use v5.10;
 use utf8;
 
+our $VERSION = 0.1;
+
 use Getopt::Long;
 use Pod::Usage;
 
@@ -17,6 +19,7 @@ sub process {
   my $pps_limit = 200;
   my $yandex_key = undef;
   my $yandex_user = undef;
+  my $version = undef;
 
   GetOptions(
     'file|f=s' => \$file,
@@ -25,7 +28,13 @@ sub process {
     'pages=i' => \$pps_limit,
     'yandex_key|y=s' => \$yandex_key,
     'yandex_user|u=s' => \$yandex_user,
+    'version|v' => \$version,
   );
+
+  if ( $version ) {
+    say $VERSION;
+    return;
+  }
 
   if ( !( $file && $keyword && $yandex_key && $yandex_user ) ) {
     pod2usage( 1 );
@@ -479,6 +488,9 @@ anchors.pl [параметры]
  Не обязательные параметры:
    --sites <количество>                  количество сайтов для обработки, по умолчанию - 50
    --pages <количество>                  лимит количества страниц для одного сайта, по умолчанию - 200
+
+ Дополнительные параметры:
+   -v, --version                         показать версию
 
 =head1 DESCRIPTION
 
