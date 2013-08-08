@@ -5,7 +5,7 @@ use warnings;
 use v5.10;
 use utf8;
 
-our $VERSION = 0.1;
+our $VERSION = 0.2;
 
 use Getopt::Long;
 use Pod::Usage;
@@ -232,8 +232,9 @@ sub _get_sentences {
   my __PACKAGE__ $self = shift;
   my $text = shift;
 
-  $text =~ s/\s+/ /g;
   $text =~ s/\&ndash\;/-/g;
+  $text =~ s/\&nbsp\;/-/g;
+  $text =~ s/\s+/ /g;
 
   my @sentences = $text =~ m/([АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ][^.|!АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ?]{20,140})/gs;
 
@@ -301,7 +302,7 @@ sub _get_anchors {
   my $sites = shift;
 
   my $sites_limit = $self->{sites_limit};
-  my $anchors = { 'ТВО' => {}, 'ТВ' => {}, 'ТВРО' => {}, 'ТВР' => {}, 'НВР' => {}, 'НВРО' => {}, };
+  my $anchors = { 'ТВО' => {}, 'ТВРО' => {}, 'ТВР' => {}, 'НВР' => {}, 'НВРО' => {}, };
 
   for ( my $cnt = 1; $cnt <= scalar( @$sites ); $cnt++ ) {
     last if $cnt > $sites_limit;
@@ -311,10 +312,7 @@ sub _get_anchors {
     my $txt = $self->_get_text( $sites->[ $cnt - 1 ] );
     my $sentences = $self->_get_sentences( $txt );
 
-    my $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tv' );
-    map { $anchors->{ 'ТВ' }->{ $_ } = 1; } @$curr_anchors;
-
-    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvo' );
+    my $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvo' );
     map { $anchors->{ 'ТВО' }->{ $_ } = 1; } @$curr_anchors;
 
     $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvro' );
@@ -345,14 +343,15 @@ sub _get_anchors_from_sentences {
   my $anchors = {};
 
   foreach my $sent ( @$sentences ) {
-    if ( $type eq 'tv' ) {
+    if ( $type eq 'tvo' ) {
       next unless $sent =~ m/$keyword/i;
 
       $sent =~ s/($keyword)/\#a\#$1\#\/a\#/i;
+
       $anchors->{ $sent } = 1;
     }
-    elsif ( $type eq 'tvo' ) {
-      next unless $sent =~ m/$keyword/i;
+    elsif ( $type eq 'tvro' ) {
+      next unless $sent =~ m/$keyword/;
 
       if ( $sent =~ m/\s.{4,20}\s$keyword\s.{4,20}\s/i ) {
         $sent =~ s/\s(.{4,20}\s$keyword\s.{4,20})\s/ \#a\#$1\#\/a\# /i;
@@ -366,33 +365,11 @@ sub _get_anchors_from_sentences {
 
       $anchors->{ $sent } = 1;
     }
-    elsif ( $type eq 'tvro' ) {
-      my @words = split /\s/, $keyword;
-      my $keyword_re = join '.{1,20}', @words;
-
-      next unless $sent =~ m/($keyword_re)/;
-      next if length( $1 ) < length( $keyword ) + 5;
-
-      if ( $sent =~ m/\s.{4,20}\s$keyword_re\s.{4,20}\s/i ) {
-        $sent =~ s/\s(.{4,20}\s$keyword_re\s.{4,20})\s/ \#a\#$1\#\/a\# /i;
-      }
-      elsif ( $sent =~ m/\s.{4,20}\s$keyword_re/i ) {
-        $sent =~ s/\s(.{4,20}\s$keyword_re)/ \#a\#$1\#\/a\#/i;
-      }
-      elsif ( $sent =~ m/$keyword_re\s.{4,20}\s/i ) {
-        $sent =~ s/($keyword_re\s.{4,20})\s/\#a\#$1\#\/a\# /i;
-      }
-
-      $anchors->{ $sent } = 1;
-    }
     elsif ( $type eq 'tvr' ) {
-      my @words = split /\s/, $keyword;
-      my $keyword_re = join '.{1,20}', @words;
+      next unless $sent =~ m/$keyword/i;
 
-      next unless $sent =~ m/($keyword_re)/;
-      next if length( $1 ) < length( $keyword ) + 5;
+      $sent = "#a#$sent#/a#";
 
-      $sent =~ s/($keyword_re)/\#a\#$1\#\/a\#/i;
       $anchors->{ $sent } = 1;
     }
     elsif ( $type eq 'nvro' ) {
@@ -459,7 +436,8 @@ sub _get_anchors_from_sentences {
 
       next if $skip;
 
-      $sent =~ s/($keyword_re)/\#a\#$1\#\/a\#/i;
+      $sent = "#a#$sent#/a#";
+
       $anchors->{ $sent } = 1;
     }
   }
