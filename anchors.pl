@@ -5,7 +5,7 @@ use warnings;
 use v5.10;
 use utf8;
 
-our $VERSION = 0.2;
+our $VERSION = 0.3;
 
 use Getopt::Long;
 use Pod::Usage;
@@ -351,16 +351,21 @@ sub _get_anchors_from_sentences {
       $anchors->{ $sent } = 1;
     }
     elsif ( $type eq 'tvro' ) {
-      next unless $sent =~ m/$keyword/;
+      next unless $sent =~ m/($keyword)/;
+      my $found = $1;
 
-      if ( $sent =~ m/\s.{4,20}\s$keyword\s.{4,20}\s/i ) {
-        $sent =~ s/\s(.{4,20}\s$keyword\s.{4,20})\s/ \#a\#$1\#\/a\# /i;
+      if ( $sent =~ m/\s.{4,20}\s\Q$found\E/i ) {
+        $sent =~ s/\s(.{4,20}\s\Q$found\E)/ \#a\#$1/i;
       }
-      elsif ( $sent =~ m/\s.{4,20}\s$keyword/i ) {
-        $sent =~ s/\s(.{4,20}\s$keyword)/ \#a\#$1\#\/a\#/i;
+      elsif ( $sent =~ m/^.{0,20}\Q$found\E/i ) {
+        $sent =~ s/^(.{0,20}\Q$found\E)/\#a\#$1/i;
       }
-      elsif ( $sent =~ m/$keyword\s.{4,20}\s/i ) {
-        $sent =~ s/($keyword\s.{4,20})\s/\#a\#$1\#\/a\# /i;
+
+      if ( $sent =~ m/\Q$found\E[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20}\s/i ) {
+        $sent =~ s/(\Q$found\E[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20})\s/$1\#\/a\# /i;
+      }
+      elsif ( $sent =~ m/\Q$found\E.{0,20}$/i ) {
+        $sent =~ s/(\Q$found\E.{0,20})$/$1\#\/a\#/i;
       }
 
       $anchors->{ $sent } = 1;
@@ -398,14 +403,18 @@ sub _get_anchors_from_sentences {
 
       next if $skip;
 
-      if ( $sent =~ m/\s.{4,20}\s$keyword_re\s.{4,20}\s/i ) {
-        $sent =~ s/\s(.{4,20}\s$keyword_re\s.{4,20})\s/ \#a\#$1\#\/a\# /i;
+      if ( $sent =~ m/\s.{4,20}\s\Q$found\E/i ) {
+        $sent =~ s/\s(.{4,20}\s\Q$found\E)/ \#a\#$1/i;
       }
-      elsif ( $sent =~ m/\s.{4,20}\s$keyword_re/i ) {
-        $sent =~ s/\s(.{4,20}\s$keyword_re)/ \#a\#$1\#\/a\#/i;
+      elsif ( $sent =~ m/^.{0,20}\Q$found\E/i ) {
+        $sent =~ s/^(.{0,20}\Q$found\E)/\#a\#$1/i;
       }
-      elsif ( $sent =~ m/$keyword_re\s.{4,20}\s/i ) {
-        $sent =~ s/($keyword_re\s.{4,20})\s/\#a\#$1\#\/a\# /i;
+
+      if ( $sent =~ m/\Q$found\E[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20}\s/i ) {
+        $sent =~ s/(\Q$found\E[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20})\s/$1\#\/a\# /i;
+      }
+      elsif ( $sent =~ m/\Q$found\E.{0,20}$/i ) {
+        $sent =~ s/(\Q$found\E.{0,20})$/$1\#\/a\#/i;
       }
 
       $anchors->{ $sent } = 1;
