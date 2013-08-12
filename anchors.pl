@@ -5,7 +5,7 @@ use warnings;
 use v5.10;
 use utf8;
 
-our $VERSION = 0.3;
+our $VERSION = 0.4;
 
 use Getopt::Long;
 use Pod::Usage;
@@ -54,7 +54,7 @@ use warnings;
 use v5.10;
 use utf8;
 
-use LWP::UserAgent;
+use LWPx::ParanoidAgent;
 use HTML::Strip;
 use Encode;
 use HTML::Restrict;
@@ -69,7 +69,7 @@ sub new {
 
   my $self = fields::new( $proto );
 
-  my $ua = LWP::UserAgent->new();
+  my $ua = LWPx::ParanoidAgent->new();
   $ua->default_header( 'Accept-Encoding' => 'utf8' );
   $ua->timeout( 10 );
 
@@ -272,6 +272,9 @@ sub _get_sub_pages {
   my @urls = $html =~ m/href\=\"(.*?)\"/g;
 
   foreach my $surl ( @urls ) {
+    next if $surl =~ m/^mailto\:/;
+    next if $surl =~ m/^ftp\:/;
+
     if ( $surl =~ m/^http/ ) {
       next unless $surl =~ m/^$domain/;
 
