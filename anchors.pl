@@ -5,7 +5,7 @@ use warnings;
 use v5.10;
 use utf8;
 
-our $VERSION = 0.4;
+our $VERSION = 0.6;
 
 use Getopt::Long;
 use Pod::Usage;
@@ -54,27 +54,39 @@ use warnings;
 use v5.10;
 use utf8;
 
-use LWPx::ParanoidAgent;
+use LWP::UserAgent;
 use HTML::Strip;
 use Encode;
 use HTML::Restrict;
 use Data::Dumper;
 use POSIX;
 use Clone qw( clone );
+use IO::Pipe;
+use Time::HiRes qw( usleep time );
+use POSIX;
+use JSON::XS;
 
-use fields qw( ua keyword type file sites_limit pps_limit pages_processed yandex_key yandex_user );
+use fields qw(
+  ua keyword type file sites_limit pps_limit pages_processed yandex_key yandex_user
+  wait_queue processing_queue processed_queue
+  processed_count progress_text anchors
+  wait_sentenses_queue processing_sentenses_queue processed_sentenses_queue
+);
+
+use constant PREPOSITIONS => [ 'на', 'или', 'не', 'от', 'той', 'них', 'он', 'она', 'бы', 'под', 'к', 'с' ];
 
 sub new {
   my $proto = shift;
 
   my $self = fields::new( $proto );
 
-  my $ua = LWPx::ParanoidAgent->new();
+  my $ua = LWP::UserAgent->new();
   $ua->default_header( 'Accept-Encoding' => 'utf8' );
-  $ua->timeout( 10 );
+  $ua->timeout( 4 );
 
   $self->{ua} = $ua;
   $self->{pages_processed} = {};
+  $self->{anchors} = { 'ТВО' => {}, 'ТВРО' => {}, 'ТВР' => {}, 'НВР' => {}, 'НВРО' => {}, };
 
   return $self;
 }
@@ -93,7 +105,7 @@ sub process {
   $| = 1;
 
   $self->{keyword} = decode_utf8( $keyword );
-  $self->{file} = $file;
+  $self->{file} = decode_utf8( $file );
   $self->{sites_limit} = $sites_limit;
   $self->{pps_limit} = $pps_limit;
   $self->{yandex_key} = $yandex_key;
@@ -119,7 +131,7 @@ sub _generate {
   foreach my $type ( keys %$anchors ) {
     say $fl $type;
 
-    foreach my $anch ( keys %{ $anchors->{ $type } } ) {
+    foreach my $anch ( sort keys %{ $anchors->{ $type } } ) {
       say $fl $anch;
     }
 
@@ -152,7 +164,7 @@ sub _get_sites {
   my $limit = ceil( $sites_limit / 10 );
 
   for my $cnt ( 0 .. $limit ) {
-    my $rsp = $ua->get( "http://xmlsearch.yandex.ru/xmlsearch?user=$yandex_user&key=$yandex_key&query=$str&lr=213&page=$cnt" );
+    my $rsp = $ua->get( "http://xmlsearch.yandex.com/xmlsearch?user=$yandex_user&key=$yandex_key&query=$str&lr=213&page=$cnt" );
 
     if ( $rsp->is_success ) {
       my $xml = $rsp->decoded_content;
@@ -182,63 +194,64 @@ sub _get_sites {
   return $pages;
 }
 
-sub _get_text {
-  my __PACKAGE__ $self = shift;
-  my $site = shift;
-
-  my $ua = $self->{ua};
-  my $pps_limit = $self->{pps_limit};
-
-  my $txt = '';
-  my $progress = '';
-  my $cnt = 0;
-
-  my $hr = HTML::Restrict->new();
-
-  my $pages = [ $site ];
-
-  foreach my $page ( @$pages ) {
-    $cnt++;
-
-    my $rsp = $ua->get( $page->{url} );
-
-    next unless $rsp->is_success;
-
-    my $html = $rsp->decoded_content;
-    next unless $html;
-
-    if ( $page->{level} <= 2 && scalar( @$pages ) < $pps_limit ) {
-      push @$pages, $self->_get_sub_pages( $page->{url}, $page->{level}, $html, scalar( @$pages ) );
-    }
-
-    my $cleared_html = $hr->process( $html );
-    next unless $cleared_html;
-
-    $txt .= $cleared_html;
-
-    $self->_clear_console( $progress );
-    $progress = "$cnt из " . scalar( @$pages );
-    print $progress;
-  }
-
-  $self->_clear_console( $progress );
-
-  $txt = decode_utf8( $txt );
-
-  return $txt;
-}
-
 sub _get_sentences {
   my __PACKAGE__ $self = shift;
-  my $text = shift;
+  my $txt = shift;
 
-  $text =~ s/\&ndash\;/-/g;
-  $text =~ s/\&nbsp\;/-/g;
-  $text =~ s/\s+/ /g;
+  $txt =~ s/(\<br\>|\&nbsp\;|\&quot\;|\<strong\>|\<\/strong\>|\<\/b\>|\<b\>|\<a.*?\>|\<\/a\>)/ /gio;
+  $txt =~ s/(-|–|\&ndash\;)/-/gio;
+  $txt =~ s/(\&laquo\;|\&raquo\;)/\"/gio;
 
-  my @sentences = $text =~ m/([АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ][^.|!АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ?]{20,140})/gs;
+  $txt =~ s/\s+/ /go;
 
-  return \@sentences;
+  my @sentences = $txt =~ m/([АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ0-9\-\!\.\,\s…\(\)\?\:\"]+)/gio;
+
+  @sentences = map { s/^[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ]+//io; $_; } @sentences;
+  @sentences = map { s/^\s+//io; s/\s+$//io; $_; } @sentences;
+
+  my %sentences_clear = ();
+
+  foreach my $snt ( @sentences ) {
+    next if length $snt < 40;
+
+    my @russian_chars = $snt =~ m/([АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ])/gio;
+    next if scalar( @russian_chars ) / length( $snt ) < 0.5;
+
+    if ( length( $snt ) < 150 ) {
+      $sentences_clear{ $snt } = 1;
+    }
+    else {
+      my @snt_split = $snt =~ m/(.+?[\.\!\?])/go;
+      @snt_split = map { s/^\s+//io; s/\s+$//io; $_; } @snt_split;
+
+      foreach my $snt_split ( @snt_split ) {
+        next if length $snt_split < 40;
+        $sentences_clear{ $snt_split } = 1;
+      }
+    }
+  }
+
+  # удаляем предложения с переспамом одинаковыми словами
+  foreach my $sentence ( keys %sentences_clear ) {
+    my @words = $sentence =~ m/([АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ]+)/gio;
+    my $skip = 0;
+    my %words_count = ();
+
+    foreach my $wrd ( @words ) {
+      next if $wrd ~~ PREPOSITIONS;
+
+      if ( $words_count{ $wrd } ) {
+        $skip = 1;
+        last;
+      }
+
+      $words_count{ $wrd } = 1;
+    }
+
+    delete $sentences_clear{ $sentence } if $skip;
+  }
+
+  return [ keys %sentences_clear ];
 }
 
 sub _clear_console {
@@ -305,35 +318,19 @@ sub _get_anchors {
   my $sites = shift;
 
   my $sites_limit = $self->{sites_limit};
-  my $anchors = { 'ТВО' => {}, 'ТВРО' => {}, 'ТВР' => {}, 'НВР' => {}, 'НВРО' => {}, };
 
   for ( my $cnt = 1; $cnt <= scalar( @$sites ); $cnt++ ) {
     last if $cnt > $sites_limit;
 
     print "Обработка сайта $cnt...";
 
-    my $txt = $self->_get_text( $sites->[ $cnt - 1 ] );
-    my $sentences = $self->_get_sentences( $txt );
-
-    my $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvo' );
-    map { $anchors->{ 'ТВО' }->{ $_ } = 1; } @$curr_anchors;
-
-    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvro' );
-    map { $anchors->{ 'ТВРО' }->{ $_ } = 1; } @$curr_anchors;
-
-    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvr' );
-    map { $anchors->{ 'ТВР' }->{ $_ } = 1; } @$curr_anchors;
-
-    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'nvr' );
-    map { $anchors->{ 'НВР' }->{ $_ } = 1; } @$curr_anchors;
-
-    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'nvro' );
-    map { $anchors->{ 'НВРО' }->{ $_ } = 1; } @$curr_anchors;
+    $self->_process_site( $sites->[ $cnt - 1 ] );
+    $self->_clear_console( $self->{progress_text} );
 
     say 'ok';
   }
 
-  return $anchors;
+  return $self->{anchors};
 }
 
 sub _get_anchors_from_sentences {
@@ -347,28 +344,27 @@ sub _get_anchors_from_sentences {
 
   foreach my $sent ( @$sentences ) {
     if ( $type eq 'tvo' ) {
-      next unless $sent =~ m/$keyword/i;
+      next unless $sent =~ m/$keyword($|[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ])/i;
 
       $sent =~ s/($keyword)/\#a\#$1\#\/a\#/i;
 
       $anchors->{ $sent } = 1;
     }
     elsif ( $type eq 'tvro' ) {
-      next unless $sent =~ m/($keyword)/;
-      my $found = $1;
+      next unless $sent =~ m/$keyword($|[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ])/i;
 
-      if ( $sent =~ m/\s.{4,20}\s\Q$found\E/i ) {
-        $sent =~ s/\s(.{4,20}\s\Q$found\E)/ \#a\#$1/i;
+      if ( $sent =~ m/\s.{4,20}\s$keyword/i ) {
+        $sent =~ s/\s(.{4,20}\s$keyword)/ \#a\#$1/i;
       }
-      elsif ( $sent =~ m/^.{0,20}\Q$found\E/i ) {
-        $sent =~ s/^(.{0,20}\Q$found\E)/\#a\#$1/i;
+      elsif ( $sent =~ m/^.{0,20}$keyword/i ) {
+        $sent =~ s/^(.{0,20}$keyword)/\#a\#$1/i;
       }
 
-      if ( $sent =~ m/\Q$found\E[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20}\s/i ) {
-        $sent =~ s/(\Q$found\E[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20})\s/$1\#\/a\# /i;
+      if ( $sent =~ m/$keyword[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20}\s/i ) {
+        $sent =~ s/($keyword[^АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯ\w].{4,20})\s/$1\#\/a\# /i;
       }
-      elsif ( $sent =~ m/\Q$found\E.{0,20}$/i ) {
-        $sent =~ s/(\Q$found\E.{0,20})$/$1\#\/a\#/i;
+      elsif ( $sent =~ m/$keyword.{0,20}$/i ) {
+        $sent =~ s/($keyword.{0,20})$/$1\#\/a\#/i;
       }
 
       $anchors->{ $sent } = 1;
@@ -382,23 +378,37 @@ sub _get_anchors_from_sentences {
     }
     elsif ( $type eq 'nvro' ) {
       my @words = split /\s/, $keyword;
-      foreach ( @words ) {
-        next if length $_ < 4;
-        $_ =~ s/\S{3}$/\\S\{1\,3\}/;
+      my @words_re = ();
+
+      foreach my $wrd ( @words ) {
+        next if length $wrd <= 3;
+
+        if ( length $wrd <= 3 ) {
+          $wrd =~ s/\S{1}$/\\S\{1\,6\}/io;
+        }
+        if ( length $wrd <= 5 ) {
+          $wrd =~ s/\S{2}$/\\S\{1\,8\}/io;
+        }
+        else {
+          $wrd =~ s/\S{3}$/\\S\{1\,8\}/io;
+        }
+
+        push @words_re, $wrd;
       }
 
-      my $keyword_re = join '.{1,20}', @words;
+      my $keyword_re = join '.{1,20}', @words_re;
 
-      next unless $sent =~ m/($keyword_re)/;
+      next unless $sent =~ m/($keyword_re)/i;
       my $found = $1;
 
-      next if length( $found ) < length( $keyword ) + 7;
+      next if length( $found ) < length( join ( ' ', @words_re ) ) + 7;
 
       @words = split /\s/, $keyword;
       my $skip = 1;
-      foreach ( @words ) {
-        next if length $_ < 4;
-        if ( $found !~ m/$_/ ) {
+      foreach my $wrd ( @words ) {
+        next if length $wrd <= 3;
+
+        if ( $found !~ m/$wrd\s/i ) {
           $skip = 0;
           last;
         }
@@ -424,23 +434,37 @@ sub _get_anchors_from_sentences {
     }
     elsif ( $type eq 'nvr' ) {
       my @words = split /\s/, $keyword;
-      foreach ( @words ) {
-        next if length $_ < 4;
-        $_ =~ s/\S{3}$/\\S\{1\,3\}/;
+      my @words_re = ();
+
+      foreach my $wrd ( @words ) {
+        next if length $wrd <= 3;
+
+        if ( length $wrd <= 3 ) {
+          $wrd =~ s/\S{1}$/\\S\{1\,6\}/io;
+        }
+        if ( length $wrd <= 5 ) {
+          $wrd =~ s/\S{2}$/\\S\{1\,8\}/io;
+        }
+        else {
+          $wrd =~ s/\S{3}$/\\S\{1\,8\}/io;
+        }
+
+        push @words_re, $wrd;
       }
 
-      my $keyword_re = join '.{1,20}', @words;
+      my $keyword_re = join '.{1,20}', @words_re;
 
-      next unless $sent =~ m/($keyword_re)/;
+      next unless $sent =~ m/($keyword_re)/i;
       my $found = $1;
 
-      next if length( $found ) < length( $keyword ) + 7;
+      next if length( $found ) < length( join ( ' ', @words_re ) ) + 7;
 
       @words = split /\s/, $keyword;
       my $skip = 1;
-      foreach ( @words ) {
-        next if length $_ < 4;
-        if ( $found !~ m/$_/ ) {
+      foreach my $wrd ( @words ) {
+        next if length $wrd <= 3;
+
+        if ( $found !~ m/$wrd\s/i ) {
           $skip = 0;
           last;
         }
@@ -455,6 +479,263 @@ sub _get_anchors_from_sentences {
   }
 
   return [ keys %$anchors ];
+}
+
+sub _process_site {
+  my __PACKAGE__ $self = shift;
+  my $site = shift;
+
+  $self->{wait_queue} = {};
+  $self->{processing_queue} = {};
+  $self->{processed_queue} = {};
+  $self->{processed_count} = 0;
+  $self->{progress_text} = '';
+  $self->{wait_sentenses_queue} = [];
+  $self->{processing_sentenses_queue} = {};
+  $self->{processed_sentenses_queue} = {};
+
+  my $wait_queue = $self->{wait_queue};
+  my $processing_queue = $self->{processing_queue};
+  my $processed_queue = $self->{processed_queue};
+  my $pages_processed = $self->{pages_processed};
+  my $wait_sentenses_queue = $self->{wait_sentenses_queue};
+  my $processing_sentenses_queue = $self->{processing_sentenses_queue};
+  my $processed_sentenses_queue = $self->{processed_sentenses_queue};
+
+  $SIG{CHLD} = 'IGNORE';
+
+  $wait_queue->{ $site->{url} } = { level => $site->{level}, };
+  $pages_processed->{ $site->{url} } = 1;
+
+  while (
+    scalar( keys %$wait_queue ) || scalar( keys %$processing_queue ) || scalar( keys %$processed_queue )
+    || scalar( @$wait_sentenses_queue ) || scalar( keys %$processing_sentenses_queue ) || scalar( keys %$processed_sentenses_queue )
+  ) {
+    $self->_push_to_processing_queue();
+    $self->_get_from_processing_queue();
+
+    $self->_push_to_processing_sentences_queue();
+    $self->_get_from_processing_sentences_queue();
+
+    $self->_check_childs();
+
+    usleep( 2 );
+  }
+
+  return;
+}
+
+sub _check_childs {
+  my __PACKAGE__ $self = shift;
+
+  my $processing_queue = $self->{processing_queue};
+  my $processed_queue = $self->{processed_queue};
+  my $processing_sentenses_queue = $self->{processing_sentenses_queue};
+  my $processed_sentenses_queue = $self->{processed_sentenses_queue};
+
+  foreach my $pid ( keys %$processing_queue ) {
+    if ( kill( 0, $pid ) == 0 ) {
+      $processed_queue->{ $pid } = 1;
+    }
+    else {
+      my $time = $processing_queue->{ $pid }->{time};
+
+      if ( time() - $time > 5 ) {
+        kill( 9, $pid );
+      }
+    }
+  }
+
+  foreach my $pid ( keys %$processing_sentenses_queue ) {
+    if ( kill( 0, $pid ) == 0 ) {
+      $processed_sentenses_queue->{ $pid } = 1;
+    }
+  }
+
+  return;
+}
+
+sub _push_to_processing_queue {
+  my __PACKAGE__ $self = shift;
+
+  my $processing_queue = $self->{processing_queue};
+  my $wait_queue = $self->{wait_queue};
+  my $ua = $self->{ua};
+
+  return if scalar( keys %$processing_queue ) >= 10;
+  return if scalar( keys %$wait_queue ) == 0;
+
+  foreach my $url ( keys %$wait_queue ) {
+    my $level = $wait_queue->{ $url }->{level};
+    delete $wait_queue->{ $url };
+
+    my $pipe = new IO::Pipe;
+    my $pid = fork;
+
+    if ( $pid == 0 ) {
+      $pipe->writer;
+      $pipe->autoflush( 1 );
+      $pipe->blocking( 0 );
+
+      my $rsp = $ua->get( $url );
+      exit unless $rsp->is_success;
+
+      print $pipe encode_utf8( $rsp->decoded_content // '' );
+
+      exit;
+    }
+    else {
+      $pipe->reader;
+      $pipe->autoflush( 1 );
+      $pipe->blocking( 0 );
+
+      $processing_queue->{ $pid } = { 'time' => time(), url => $url, pipe => $pipe, level => $level, txt => '', };
+      return;
+    }
+  }
+
+  return;
+}
+
+sub _get_from_processing_queue {
+  my __PACKAGE__ $self = shift;
+
+  my $processed_queue = $self->{processed_queue};
+  my $processing_queue = $self->{processing_queue};
+  my $processed_count = $self->{processed_count};
+  my $pps_limit = $self->{pps_limit};
+  my $wait_queue = $self->{wait_queue};
+  my $progress_text = $self->{progress_text};
+  my $wait_sentenses_queue = $self->{wait_sentenses_queue};
+
+  return unless scalar( keys %$processed_queue ) > 0;
+
+  foreach my $pid ( keys %$processed_queue ) {
+    $processed_count++;
+    my $all_count = scalar( keys %$wait_queue ) + scalar( keys %$processing_queue ) + $processed_count - 1;
+
+    $self->_clear_console( $progress_text );
+    $progress_text = "$processed_count из $all_count";
+    print $progress_text;
+
+    my $url = $processing_queue->{ $pid }->{url};
+    my $time = $processing_queue->{ $pid }->{time};
+    my $pipe = $processing_queue->{ $pid }->{pipe};
+    my $level = $processing_queue->{ $pid }->{level};
+    my $txt = $processing_queue->{ $pid }->{txt};
+
+    delete $processing_queue->{ $pid };
+    delete $processed_queue->{ $pid };
+
+    my @lines = <$pipe>;
+    if ( scalar( @lines ) ) {
+      $txt .= join '', @lines;
+    }
+
+    my $html = decode_utf8( $txt );
+
+    next unless $html;
+    next if length $html > 300000;
+
+    if ( $level <= 2 && $all_count < $pps_limit ) {
+      my @subpages = $self->_get_sub_pages( $url, $level, $html, $all_count );
+      map { $wait_queue->{ $_->{url} } = { level => $_->{level}, }; } @subpages;
+    }
+
+    push @$wait_sentenses_queue, $html;
+  }
+
+  $self->{processed_count} = $processed_count;
+  $self->{progress_text} = $progress_text;
+
+  return;
+}
+
+sub _push_to_processing_sentences_queue {
+  my __PACKAGE__ $self = shift;
+
+  my $processing_sentenses_queue = $self->{processing_sentenses_queue};
+  my $wait_sentenses_queue = $self->{wait_sentenses_queue};
+  my $anchors = { 'ТВО' => {}, 'ТВРО' => {}, 'ТВР' => {}, 'НВР' => {}, 'НВРО' => {}, };
+
+  return if scalar( keys %$processing_sentenses_queue ) >= 3;
+  return if scalar( @$wait_sentenses_queue ) == 0;
+
+  my $txt = pop @$wait_sentenses_queue;
+
+  my $pipe = new IO::Pipe;
+  my $pid = fork;
+
+  if ( $pid == 0 ) {
+    $pipe->writer;
+    $pipe->autoflush( 1 );
+    $pipe->blocking( 0 );
+
+    my $sentences = $self->_get_sentences( $txt );
+
+    my $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvo' );
+    map { $anchors->{ 'ТВО' }->{ $_ } = 1; } @$curr_anchors;
+
+    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvro' );
+    map { $anchors->{ 'ТВРО' }->{ $_ } = 1; } @$curr_anchors;
+
+    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'tvr' );
+    map { $anchors->{ 'ТВР' }->{ $_ } = 1; } @$curr_anchors;
+
+    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'nvr' );
+    map { $anchors->{ 'НВР' }->{ $_ } = 1; } @$curr_anchors;
+
+    $curr_anchors = $self->_get_anchors_from_sentences( clone( $sentences ), 'nvro' );
+    map { $anchors->{ 'НВРО' }->{ $_ } = 1; } @$curr_anchors;
+
+    print $pipe encode_utf8( encode_json( $anchors ) );
+
+    exit;
+  }
+  else {
+    $pipe->reader;
+    $pipe->autoflush( 1 );
+    $pipe->blocking( 0 );
+
+    $processing_sentenses_queue->{ $pid } = { 'time' => time(), pipe => $pipe, };
+    return;
+  }
+
+  return;
+}
+
+sub _get_from_processing_sentences_queue {
+  my __PACKAGE__ $self = shift;
+
+  my $processed_sentenses_queue = $self->{processed_sentenses_queue};
+  my $processing_sentenses_queue = $self->{processing_sentenses_queue};
+  my $wait_sentenses_queue = $self->{wait_sentenses_queue};
+  my $anchors = $self->{anchors};
+
+  return unless scalar( keys %$processed_sentenses_queue ) > 0;
+
+  foreach my $pid ( keys %$processed_sentenses_queue ) {
+    my $pipe = $processing_sentenses_queue->{ $pid }->{pipe};
+
+    delete $processing_sentenses_queue->{ $pid };
+    delete $processed_sentenses_queue->{ $pid };
+
+    my $txt = '';
+    my @lines = <$pipe>;
+    if ( scalar( @lines ) ) {
+      $txt .= join '', @lines;
+    }
+
+    my $anch = decode_json( decode_utf8( $txt ) );
+
+    map { $anchors->{ 'ТВО' }->{ $_ } = 1; } keys %{ $anch->{ 'ТВО' } };
+    map { $anchors->{ 'ТВРО' }->{ $_ } = 1; } keys %{ $anch->{ 'ТВРО' } };
+    map { $anchors->{ 'ТВР' }->{ $_ } = 1; } keys %{ $anch->{ 'ТВР' } };
+    map { $anchors->{ 'НВР' }->{ $_ } = 1; } keys %{ $anch->{ 'НВР' } };
+    map { $anchors->{ 'НВРО' }->{ $_ } = 1; } keys %{ $anch->{ 'НВРО' } };
+  }
+
+  return;
 }
 
 1;
